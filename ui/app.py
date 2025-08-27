@@ -1,22 +1,28 @@
+
 import tkinter as tk
 from tkinter import simpledialog, messagebox
+
 import threading
+import socket
 import hashlib
 import os
-import socket
-import datetime
+import vc.network as vc
+import vc.audio as audio
 
-import voice_communicator_modular as vc
+
+#import voice_communicator_modular as vc
+
 
 class VoiceApp:
     def __init__(self, root: tk.Tk):
+
+        audio.on_call_started = self.on_call_started
+        audio.on_call_ended = self.on_call_ended
         self.root = root
         self.root.title("Voice Communicator")
         self.root.geometry("750x400")
 
         # =======   dane   =======
-        self.contacts = vc.load_contacts()
-        self.listening = False
         self.current_chat_ip = None
         self.msg_entry = None
 
@@ -39,8 +45,15 @@ class VoiceApp:
         self.add_contact_button = tk.Button(btn_frame, text="Nawiąż kontakt", command=self.open_contact_window)
         self.add_contact_button.pack(side="left", padx=(0, 10))
 
-        self.toggle_listen_button = tk.Button(btn_frame, text="Włącz nasłuch", command=self.toggle_listener)
-        self.toggle_listen_button.pack(side="left")
+        self.toggle_listen_button = tk.Button(btn_frame, text="offline", command=self.toggle_listener)
+        self.toggle_listen_button.pack(side="left", padx=(0, 10))
+
+        self.delete_contact_button = tk.Button(btn_frame, text="Usuń kontakt", command=self.delete_selected_contact)
+        self.delete_contact_button.pack(side="left", padx=(0, 10))
+
+        self.listening = True
+        vc.start_listener()
+        self._update_online_button(True)
 
         chat_outer = tk.Frame(root, relief="sunken", bd=1)
         chat_outer.grid(row=1, column=1, sticky="nsew", padx=(0, 10), pady=(0, 10))
@@ -62,10 +75,6 @@ class VoiceApp:
         self.msg_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self.msg_entry.bind("<Return>", lambda _e: self.send_message())
 
-        self.chat_init_btn = tk.Button(btn_frame, text="Handshake czatu",
-                                       command=self.init_chat_for_selected)
-        self.chat_init_btn.pack(side="left", padx=(0, 10))
-
         send_btn = tk.Button(entry_frame, text="Wyślij", width=10, command=self.send_message)
         send_btn.grid(row=0, column=1)
 ##
@@ -77,22 +86,63 @@ class VoiceApp:
         vc.on_request_contact_name = self.gui_contact_naming
         vc.on_text_message = self.gui_on_text_message
 
+    def delete_selected_contact(self):
+        sel = self.contacts_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("Usuń kontakt", "Wybierz kontakt z listy.")
+            return
+        index = sel[0]
+        name, ip, _ = self.contacts[index]
+
+        if not messagebox.askyesno(
+                "Potwierdzenie",
+                f"Czy na pewno usunąć kontakt „{name}” ({ip}) oraz całą jego konwersację?"
+        ):
+            return
+
+        ok = vc.delete_contact(ip)  # usuwa też historię
+        if not ok:
+            messagebox.showerror("Błąd", "Nie udało się usunąć kontaktu.")
+            return
+
+        # odśwież listę i wyczyść widok czatu, jeśli patrzyliśmy na ten kontakt
+        self.refresh_contacts()
+        if self.current_chat_ip == ip:
+            self.current_chat_ip = None
+            self.chat_text.config(state=tk.NORMAL)
+            self.chat_text.delete("1.0", tk.END)
+            self.chat_text.insert(tk.END, "Brak wiadomości.")
+            self.chat_text.config(state=tk.DISABLED)
+
+    def _update_online_button(self, online: bool):
+        if online:
+            self.toggle_listen_button.config(text="online", bg="#2ecc71", activebackground="#27ae60", fg="white")
+        else:
+            self.toggle_listen_button.config(text="offline", bg="#e74c3c", activebackground="#c0392b", fg="white")
+
+
     def init_chat_for_selected(self):
         sel = self.contacts_listbox.curselection()
         if not sel:
             return
         _, ip, _ = self.contacts[sel[0]]
         vc.send_chat_hello(ip)
-        messagebox.showinfo("Czat", f"Wysłano CHELLO do {ip}")
+        messagebox.showinfo("Czat", f"Wysłano HELLO do {ip}")
 
     def gui_on_text_message(self, ip, ts, text, incoming):
         if ip != self.current_chat_ip:
             return
-        prefix = "Ty" if not incoming else ip
+        who = "Ty" if not incoming else self._name_for_ip(ip)
         self.chat_text.config(state=tk.NORMAL)
-        self.chat_text.insert(tk.END, f"[{ts}] {prefix}: {text}\n")
+        self.chat_text.insert(tk.END, f"[{ts}] {who}: {text}\n")
         self.chat_text.see(tk.END)
         self.chat_text.config(state=tk.DISABLED)
+
+    def _name_for_ip(self, ip: str) -> str:
+        for name, saved_ip, _ in self.contacts:
+            if saved_ip == ip:
+                return name
+        return ip
 
     def gui_contact_naming(self, ip, rsa_bytes, save_cb):
         def _ask():
@@ -120,7 +170,26 @@ class VoiceApp:
         text = self.msg_entry.get().strip()
         if not text or not self.current_chat_ip:
             return
-        vc.send_text_message(self.current_chat_ip, text)
+
+        # >>> NOWE ZASADY:
+        # 1) My musimy być online
+        if not vc.is_online():
+            messagebox.showwarning("Czat", "Jesteś offline. Włącz tryb online, aby wysłać wiadomość.")
+            return
+
+        # 2) Automatyczny handshake przy wysyłaniu (bez klikania)
+        if not vc.ensure_chat_ready(self.current_chat_ip, timeout=2.0):
+            messagebox.showinfo("Czat", "Nie udało się nawiązać szyfrowanego kanału (druga osoba prawdopodobnie offline). "
+                                        "Wiadomość nie została wysłana ani zapisana.")
+            return
+
+        # 3) Wysłanie (zabezpieczenie: nie zapisujemy, jeśli wysyłka zablokowana)
+        ok = vc.send_text_message(self.current_chat_ip, text)
+        if not ok:
+            messagebox.showinfo("Czat", "Nie udało się wysłać (brak klucza lub offline). "
+                                        "Wiadomość nie została zapisana.")
+            return
+
         self.msg_entry.delete(0, tk.END)
 
     def open_contact_window(self):
@@ -141,11 +210,8 @@ class VoiceApp:
             if not ip or not name:
                 messagebox.showerror("Błąd", "Wprowadź dane.")
                 return
-            rsa_priv = vc.load_or_generate_rsa_keys()
-            rsa_pub = vc.get_rsa_public_bytes(rsa_priv)
-            fpr = hashlib.sha256(rsa_pub).hexdigest()
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(b"FPR" + fpr.encode(), (ip, vc.CONTROL_PORT))
+            # NOWE: jedna funkcja, która i wyśle FPR, i zapamięta nazwę
+            vc.initiate_contact(ip, name)
             messagebox.showinfo("Wysłano", f"Wysłano fingerprint do {ip}")
             dialog.destroy()
 
@@ -154,12 +220,12 @@ class VoiceApp:
     def toggle_listener(self):
         if self.listening:
             self.listening = False
-            self.toggle_listen_button.config(text="Włącz nasłuch")
             vc.stop_listener()
+            self._update_online_button(False)
         else:
             self.listening = True
-            self.toggle_listen_button.config(text="Wyłącz nasłuch")
-            vc.start_listener()   # bez argumentów
+            vc.start_listener()
+            self._update_online_button(True)
 
     #  wczytanie czatu
     def on_contact_select(self, _event):
@@ -186,7 +252,7 @@ class VoiceApp:
                     if who == "ME":
                         prefix = "Ty"
                     else:
-                        prefix = ip
+                        prefix = self._name_for_ip(ip)  # <<< ZMIANA: nazwa zamiast IP
                     self.chat_text.insert(tk.END, f"[{ts}] {prefix}: {msg}\n")
         else:
             self.chat_text.insert(tk.END, "Brak wiadomości.")
@@ -241,8 +307,6 @@ class VoiceApp:
             display = f"{name} ({ip})"
             self.contacts_listbox.insert(tk.END, display)
 
-
-# --------------------------------------------------
 if __name__ == "__main__":
     root = tk.Tk()
     app = VoiceApp(root)
