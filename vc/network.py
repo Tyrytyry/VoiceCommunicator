@@ -338,8 +338,6 @@ def start_listener():
                     _safe(on_incoming_call_request, ip, None, _accept, _reject)
                     continue
 
-
-
                 elif data.startswith(b"OKFPR"):
                     rsa_data = data[len(b"OKFPR"):]
                     my_priv = load_or_generate_rsa_keys()
@@ -362,9 +360,14 @@ def start_listener():
                         pass
                     _safe(on_sas_confirm, ip, pin, _accept, _reject)
 
+                elif data.startswith(b"FPR"):
+                    fingerprint = data[3:].decode()
+                    PENDING_FPR[ip] = fingerprint
 
+                    def _accept():
+                        send_okfpr(ip)
 
-
+                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
                 elif data.startswith(b"MYRSA"):
                     rsa_data = data[len(b"MYRSA"):]
