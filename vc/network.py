@@ -340,8 +340,11 @@ def start_listener():
 
 
                 elif data.startswith(b"OKFPR"):
+
                     rsa_data = data[len(b"OKFPR"):]
+
                     my_priv = load_or_generate_rsa_keys()
+
                     my_pub = get_rsa_public_bytes(my_priv)
                     pin = compute_sas_pin(my_pub, rsa_data)
                     send_myrsa(ip)
@@ -359,6 +362,16 @@ def start_listener():
                     def _reject():
                         pass
                     _safe(on_sas_confirm, ip, pin, _accept, _reject)
+
+                elif data.startswith(b"FPR"):
+                    fingerprint = data[3:].decode()
+                    PENDING_FPR[ip] = fingerprint  # zapamiętaj, by przy MYRSA sprawdzić zgodność
+
+                    # pokaż okno „Nowy fingerprint” i po akceptacji odeślij OKFPR (twój RSA)
+                    def _accept():
+                        send_okfpr(ip)
+
+                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
                 elif data.startswith(b"MYRSA"):
                     rsa_data = data[len(b"MYRSA"):]
