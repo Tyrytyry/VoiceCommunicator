@@ -338,36 +338,27 @@ def start_listener():
                     _safe(on_incoming_call_request, ip, None, _accept, _reject)
                     continue
 
+
                 elif data.startswith(b"OKFPR"):
                     rsa_data = data[len(b"OKFPR"):]
                     my_priv = load_or_generate_rsa_keys()
                     my_pub = get_rsa_public_bytes(my_priv)
                     pin = compute_sas_pin(my_pub, rsa_data)
+                    send_myrsa(ip)
                     pending_name = PENDING_NAMES.get(ip)
                     def _accept():
                         if pending_name:
                             save_contact(pending_name, ip, rsa_data)
                             PENDING_NAMES.pop(ip, None)
-                            send_myrsa(ip)
                             _safe(on_contact_saved, pending_name, ip)
                         else:
                             def _save(name):
                                 save_contact(name, ip, rsa_data)
-                                send_myrsa(ip)
                                 _safe(on_contact_saved, name, ip)
                             _safe(on_request_contact_name, ip, rsa_data, _save)
                     def _reject():
                         pass
                     _safe(on_sas_confirm, ip, pin, _accept, _reject)
-
-                elif data.startswith(b"FPR"):
-                    fingerprint = data[3:].decode()
-                    PENDING_FPR[ip] = fingerprint
-
-                    def _accept():
-                        send_okfpr(ip)
-
-                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
                 elif data.startswith(b"MYRSA"):
                     rsa_data = data[len(b"MYRSA"):]

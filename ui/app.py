@@ -302,8 +302,10 @@ class VoiceApp:
 
     def gui_new_fpr(self, ip, fingerprint, accept_cb):
         def _ask():
-            if messagebox.askyesno("Nowy fingerprint", f"Otrzymano fingerprint od {ip}:\n{fingerprint}\nZaakceptować?"):
+            msg = f"Nowa prośba o dodanie kontaktu od {ip}.\nZaakceptować?"
+            if messagebox.askyesno("Prośba o kontakt", msg):
                 accept_cb()
+
         self.root.after(0, _ask)
 
     def open_call_window(self, peer_name, peer_ip):
