@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
 from .crypto import (
     generate_ecdh_key, get_public_bytes, sign_data_rsa, verify_rsa_signature,
     load_or_generate_rsa_keys, derive_shared_key, get_rsa_public_bytes, load_peer_public_key,
+    compute_sas_pin,
 )
 from .audio import start_audio_stream, end_call
 from . import audio as _audio
@@ -54,6 +55,10 @@ on_busy                  = None
 on_text_message          = None
 
 
+PENDING_FPR   = {}
+
+on_sas_confirm     = None
+on_security_alert  = None
 
 
 def delete_contact(ip: str, remove_history: bool = True) -> bool:
@@ -333,44 +338,58 @@ def start_listener():
                     _safe(on_incoming_call_request, ip, None, _accept, _reject)
                     continue
 
-                elif data.startswith(b"FPR"):
-                    fingerprint = data[3:].decode()
-
-                    def _accept():
-                        send_okfpr(ip)                     # odsyłamy nasz RSA
-                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
 
                 elif data.startswith(b"OKFPR"):
                     rsa_data = data[len(b"OKFPR"):]
-                    pending_name = PENDING_NAMES.pop(ip, None)
-                    if pending_name:  # mamy już nazwę od użytkownika
-                        save_contact(pending_name, ip, rsa_data)
-                        send_myrsa(ip)  # wyślij nasz RSA
-                        _safe(on_contact_saved, pending_name, ip)
-                    else:
-                        # stary tryb – zapytaj o nazwę tylko jeśli nie inicjowaliśmy my
-                        def _save(name):
-                            save_contact(name, ip, rsa_data)
+                    my_priv = load_or_generate_rsa_keys()
+                    my_pub = get_rsa_public_bytes(my_priv)
+                    pin = compute_sas_pin(my_pub, rsa_data)
+                    pending_name = PENDING_NAMES.get(ip)
+                    def _accept():
+                        if pending_name:
+                            save_contact(pending_name, ip, rsa_data)
+                            PENDING_NAMES.pop(ip, None)
                             send_myrsa(ip)
-                            _safe(on_contact_saved, name, ip)
+                            _safe(on_contact_saved, pending_name, ip)
+                        else:
+                            def _save(name):
+                                save_contact(name, ip, rsa_data)
+                                send_myrsa(ip)
+                                _safe(on_contact_saved, name, ip)
+                            _safe(on_request_contact_name, ip, rsa_data, _save)
+                    def _reject():
+                        pass
+                    _safe(on_sas_confirm, ip, pin, _accept, _reject)
 
-                        _safe(on_request_contact_name, ip, rsa_data, _save)
+
 
 
 
                 elif data.startswith(b"MYRSA"):
-
                     rsa_data = data[len(b"MYRSA"):]
-                    pending_name = PENDING_NAMES.pop(ip, None)
-                    if pending_name:
-                        save_contact(pending_name, ip, rsa_data)
-                        _safe(on_contact_saved, pending_name, ip)
-                    else:
-                        def _save(name):
-                            save_contact(name, ip, rsa_data)
-                            _safe(on_contact_saved, name, ip)
-                        _safe(on_request_contact_name, ip, rsa_data, _save)
+                    expected = PENDING_FPR.pop(ip, None)
+                    if expected:
+                        calc = hashlib.sha256(rsa_data).hexdigest()
+                        if calc != expected:
+                            _safe(on_security_alert, ip, "Odrzucono: klucz RSA nie pasuje do fingerprintu (FPR).")
+                            continue  # nie zapisuj, przerwij
+                    my_priv = load_or_generate_rsa_keys()
+                    my_pub = get_rsa_public_bytes(my_priv)
+                    pin = compute_sas_pin(my_pub, rsa_data)
+                    def _accept():
+                        pending_name = PENDING_NAMES.pop(ip, None)
+                        if pending_name:
+                            save_contact(pending_name, ip, rsa_data)
+                            _safe(on_contact_saved, pending_name, ip)
+                        else:
+                            def _save(name):
+                                save_contact(name, ip, rsa_data)
+                                _safe(on_contact_saved, name, ip)
+                            _safe(on_request_contact_name, ip, rsa_data, _save)
+                    def _reject():
+                        pass
+                    _safe(on_sas_confirm, ip, pin, _accept, _reject)
 
                 # odbiorca kończy rozmowę
                 elif data.startswith(b"END"):

@@ -83,8 +83,37 @@ class VoiceApp:
         vc.on_incoming_call_request = self.gui_incoming_call
         vc.on_new_fpr               = self.gui_new_fpr
         vc.on_contact_saved         = lambda *_: self.refresh_contacts()
-        vc.on_request_contact_name = self.gui_contact_naming
-        vc.on_text_message = self.gui_on_text_message
+        vc.on_request_contact_name  = self.gui_contact_naming
+        vc.on_text_message          = self.gui_on_text_message
+        vc.on_sas_confirm           = self.gui_sas_confirm
+        vc.on_security_alert        = self.gui_security_alert
+
+    def _name_for_ip(self, ip: str) -> str:
+        for name, saved_ip, _ in vc.load_contacts():
+            if saved_ip == ip:
+                return name
+        return ip
+
+    def gui_security_alert(self, ip, text):
+        def _show():
+            name = self._name_for_ip(ip)
+            messagebox.showerror("Bezpieczeństwo", f"{text}\nKontakt: {name} ({ip})")
+
+        self.root.after(0, _show)
+
+    def gui_sas_confirm(self, ip, pin, accept_cb, reject_cb):
+        def _ask():
+            name = self._name_for_ip(ip)
+            msg = (f"Weryfikacja bezpieczeństwa (SAS)\n\n"
+                   f"Kontakt: {name} ({ip})\n"
+                   f"PIN: {pin}\n\n"
+                   f"Porównaj PIN z drugą stroną. Czy się zgadza?")
+            if messagebox.askyesno("Potwierdź PIN", msg):
+                accept_cb()
+            else:
+                reject_cb()
+
+        self.root.after(0, _ask)
 
     def delete_selected_contact(self):
         sel = self.contacts_listbox.curselection()

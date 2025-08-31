@@ -1,5 +1,5 @@
 import os
-
+import hashlib
 
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import serialization, hashes
@@ -20,6 +20,16 @@ def load_or_generate_rsa_keys():
             serialization.NoEncryption()
         ))
     return private_key
+
+def compute_sas_pin(pub_a: bytes, pub_b: bytes, digits: int = 8) -> str:
+    """
+    Deterministyczny PIN (SAS) z dwóch kluczy publicznych.
+    Obie strony dostają ten sam PIN bez wysyłania go po sieci.
+    """
+    a, b = (pub_a, pub_b) if pub_a < pub_b else (pub_b, pub_a)
+    h = hashlib.sha256(a + b).digest()
+    n = int.from_bytes(h[:6], "big") % (10 ** digits)  # ~48 bitów → 8 cyfr
+    return f"{n:0{digits}d}"
 
 def get_rsa_public_bytes(private_key):
     return private_key.public_key().public_bytes(
