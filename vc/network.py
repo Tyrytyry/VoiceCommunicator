@@ -1,61 +1,51 @@
 import socket
 import hashlib
+import os
 import threading
 import time
-import os
-import queue
-import numpy as np
-import sounddevice as sd
 
-from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
+from .crypto import (
+    generate_ecdh_key, get_public_bytes, sign_data_rsa, verify_rsa_signature,
+    load_or_generate_rsa_keys, derive_shared_key, get_rsa_public_bytes, load_peer_public_key,
+    compute_sas_pin,
+)
+from .audio import start_audio_stream, end_call
+from . import audio as _audio
 from datetime import datetime
 from pathlib import Path
 
 
+
 CONTROL_PORT = 5002
-AUDIO_PORT = 5003
-SAMPLE_RATE = 44100
-CHANNELS = 1 #  poprawić to
-BLOCK_FRAMES = 256
-PACKET_SIZE = BLOCK_FRAMES * CHANNELS * 2
+TEXT_PORT   = CONTROL_PORT
 
-RSA_PRIVATE_FILE = "rsa_key.pem"
-CONTACTS_FILE = "contacts.txt"
 
-AUDIO_QUEUE = queue.Queue()
-stop_audio = threading.Event()
-aesgcm = None
-send_nonce_counter = 0
-nonce_prefix = b''
-remote_ip_for_send = None
+#CHAT_HELLO = b"HELLO"
+#CHAT_ACK   = b"CACK"
+#TEXT_MSG_PREFIX   = b"MS2"
+#MSG_PREFIX  = b"MSG"
+
+CHAT_PREFIX_CALLER = b"\x02\x00\x00\x00"
+CHAT_PREFIX_CALLEE = b"\x03\x00\x00\x00"
+PENDING_NAMES = {}
 listener_stop_event = threading.Event()
 listener_sock = None
-on_request_contact_name = None
-TEXT_PORT   = CONTROL_PORT
-MSG_PREFIX  = b"MSG"
 
 call_active = False
 call_lock = threading.Lock()
-remote_call_ip = None
-
-on_call_started = None
-on_call_ended   = None
-
-CHAT_HELLO = b"CHELLO"
-CHAT_ACK   = b"CACK"
-TEXT_MSG_PREFIX   = b"MS2"
-CHAT_PREFIX_CALLER = b"\x02\x00\x00\x00"
-CHAT_PREFIX_CALLEE = b"\x03\x00\x00\x00"
 
 CHAT_KEYS         = {}
 CHAT_NONCE_PREFIX = {}
 CHAT_SEND_COUNTER = {}
 PENDING_CHAT = {}
 
+CONTACTS_FILE = "contacts.txt"
 
+on_request_contact_name = None
 on_incoming_call_request = None
 on_call_started          = None
 on_call_ended            = None
@@ -65,47 +55,99 @@ on_busy                  = None
 on_text_message          = None
 
 
+PENDING_FPR   = {}
 
-def _finalize_chat_key(ip: str, my_priv, their_pub_bytes: bytes, caller: bool):
-    chat_key = HKDF(
-        algorithm=hashes.SHA256(), length=32, salt=None, info=b"vc-chat-v1"
-    ).derive(my_priv.exchange(ec.ECDH(), load_peer_public_key(their_pub_bytes)))
-
-    CHAT_KEYS[ip] = chat_key
-    CHAT_NONCE_PREFIX[ip] = CHAT_PREFIX_CALLER if caller else CHAT_PREFIX_CALLEE
-    CHAT_SEND_COUNTER[ip] = 0 if caller else 1
-    print(f"[CHAT] handshake OK z {ip}")
+on_sas_confirm     = None
+on_security_alert  = None
 
 
-def _send_chat_ack(ip: str, their_pub_bytes: bytes):
-    """Wysyłamy CACK i kończymy handshake."""
-    priv = generate_ecdh_key()
-    pub  = get_public_bytes(priv)
+def delete_contact(ip: str, remove_history: bool = True) -> bool:
+    """Usuwa kontakt o podanym IP z pliku kontaktów oraz (domyślnie) całą konwersację."""
+    try:
+        # Przepisz plik kontaktów bez wskazanego IP
+        entries = load_contacts(raw=True)
+        changed = False
+        with open(CONTACTS_FILE, "w") as f:
+            for parts in entries:
+                if len(parts) < 2:
+                    continue
+                if parts[1] == ip:
+                    changed = True
+                    continue
+                f.write("|".join(parts) + "\n")
 
+        # Usuń historię rozmów
+        if remove_history:
+            try:
+                _msg_file(ip).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Wyczyść stan czatu dla tego IP
+        CHAT_KEYS.pop(ip, None)
+        CHAT_NONCE_PREFIX.pop(ip, None)
+        CHAT_SEND_COUNTER.pop(ip, None)
+        PENDING_CHAT.pop(ip, None)
+        try:
+            PENDING_NAMES.pop(ip, None)  # jeśli dodałeś wcześniej PENDING_NAMES
+        except NameError:
+            pass
+
+        return changed
+    except Exception as e:
+        print("[delete_contact] error:", e)
+        return False
+
+
+
+
+def initiate_contact(ip: str, name: str):
+    """
+    Inicjuje wymianę fingerprintów z podaną nazwą.
+    Po OKFPR/MYRSA zapisze kontakt bez ponownego pytania o nazwę.
+    """
     rsa_priv = load_or_generate_rsa_keys()
-    signature = sign_data_rsa(rsa_priv, pub)
+    rsa_pub = get_rsa_public_bytes(rsa_priv)
+    fpr = hashlib.sha256(rsa_pub).hexdigest()
 
-    payload = CHAT_ACK + pub + signature
+    # zapamiętaj nazwę, aby nie pytać drugi raz
+    PENDING_NAMES[ip] = name
+
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(payload, (ip, CONTROL_PORT))
-
-    _finalize_chat_key(ip, priv, their_pub_bytes, caller=False)
+        s.sendto(b"FPR" + fpr.encode(), (ip, CONTROL_PORT))
 
 
-def send_chat_hello(remote_ip: str):
-    priv = generate_ecdh_key()
-    pub  = get_public_bytes(priv)
+def is_online() -> bool:
+    return not listener_stop_event.is_set()
 
-    rsa_priv = load_or_generate_rsa_keys()
-    signature = sign_data_rsa(rsa_priv, pub)
+def ensure_chat_ready(remote_ip: str, timeout: float = 2.0) -> bool:
+    """
+    Zapewnia, że istnieje klucz czatu do remote_ip.
+    Jeśli nie ma – wysyła HELLO i czeka na zakończenie handshaku (CACK/FINALIZE) do 'timeout' s.
+    Zwraca True, jeśli klucz gotowy, False w przeciwnym razie.
+    """
+    if not is_online():
+        return False
 
-    payload = CHAT_HELLO + pub + signature + get_rsa_public_bytes(rsa_priv)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(payload, (remote_ip, CONTROL_PORT))
+    # już gotowe
+    if CHAT_KEYS.get(remote_ip):
+        return True
 
-    PENDING_CHAT[remote_ip] = priv 
-    CHAT_NONCE_PREFIX[remote_ip] = CHAT_PREFIX_CALLER
-    CHAT_SEND_COUNTER[remote_ip] = 0
+    # musimy znać kontakt i jego klucz RSA
+    peer_rsa = next((rsa for _, ip, rsa in load_contacts() if ip == remote_ip), None)
+    if peer_rsa is None:
+        return False
+
+    # wyślij HELLO i czekaj
+    send_chat_hello(remote_ip)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if CHAT_KEYS.get(remote_ip):
+            return True
+        if not is_online():
+            break
+        time.sleep(0.05)
+    return False
 
 def _msg_file(ip: str) -> Path:
     return Path(f"messages_{ip}.txt")
@@ -114,11 +156,56 @@ def _append_history(ip: str, who: str, ts: str, text: str):
     with _msg_file(ip).open("a", encoding="utf-8") as f:
         f.write(f"{who}|{ts}|{text}\n")
 
+def _safe(cb, *a):
+    if cb:
+        try:
+            cb(*a)
+        except Exception:
+            pass
+
+def send_okfpr(ip):
+    rsa_private = load_or_generate_rsa_keys()
+    rsa_pub = get_rsa_public_bytes(rsa_private)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(b"OKFPR" + rsa_pub, (ip, CONTROL_PORT))
+
+def send_myrsa(ip):
+    rsa_private = load_or_generate_rsa_keys()
+    rsa_pub = get_rsa_public_bytes(rsa_private)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(b"MYRSA" + rsa_pub, (ip, CONTROL_PORT))
+
+
+def send_busy(ip: str):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(b"BUSY", (ip, CONTROL_PORT))
+
+def send_chat_hello(remote_ip: str):
+    priv = generate_ecdh_key()
+    pub  = get_public_bytes(priv)
+
+    rsa_priv = load_or_generate_rsa_keys()
+    signature = sign_data_rsa(rsa_priv, pub)
+
+    payload = b"HELLO" + pub + signature + get_rsa_public_bytes(rsa_priv)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(payload, (remote_ip, CONTROL_PORT))
+
+    PENDING_CHAT[remote_ip] = priv
+    CHAT_NONCE_PREFIX[remote_ip] = CHAT_PREFIX_CALLER
+    CHAT_SEND_COUNTER[remote_ip] = 0
+
+
 
 def send_text_message(remote_ip: str, text: str):
+    # >>> ZMIANA: nie wysyłamy, jeśli my jesteśmy offline
+    if not is_online():
+        print("[CHAT] Lokalnie offline – nie wysyłam.")
+        return False
+
     key = CHAT_KEYS.get(remote_ip)
     if key is None:
-        print("[CHAT] Brak klucza – nawiąż rozmowę audio, aby uzyskać key.")
+        print("[CHAT] Brak klucza – nawiąż czat (ensure_chat_ready) przed wysłaniem.")
         return False
 
     prefix  = CHAT_NONCE_PREFIX[remote_ip]
@@ -127,118 +214,22 @@ def send_text_message(remote_ip: str, text: str):
     CHAT_SEND_COUNTER[remote_ip] += 2
 
     ciphertext = AESGCM(key).encrypt(nonce, text.encode("utf-8"), None)
-    packet = TEXT_MSG_PREFIX + nonce + ciphertext
+    packet = b"MS2" + nonce + ciphertext
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(packet, (remote_ip, CONTROL_PORT))
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(packet, (remote_ip, CONTROL_PORT))
+    except Exception:
+        # brak wysyłki -> nic nie zapisuj
+        return False
 
+    # >>> WAŻNE: zapis tylko gdy (lokalnie) online i mamy klucz (czyli obie strony były online w chwili handshaku)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     _append_history(remote_ip, "ME", ts, text)
     _safe(on_text_message, remote_ip, ts, text, False)
     return True
 
-def _create_audio_socket():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", AUDIO_PORT))
-    return s
 
-audio_sock = _create_audio_socket()
-
-
-def send_busy(ip: str):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(b"BUSY", (ip, CONTROL_PORT))
-
-def _safe(cb, *a):
-    if cb:
-        try:
-            cb(*a)
-        except Exception:
-            pass
-
-
-def is_call_active() -> bool:
-    with call_lock:
-        return call_active
-
-def end_call(send_signal=True):
-    global call_active, remote_call_ip, stop_audio
-    with call_lock:
-        if not call_active:
-            return
-        call_active = False
-
-    stop_audio.set()
-
-    if send_signal and remote_call_ip:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.sendto(b"END", (remote_call_ip, CONTROL_PORT))
-        except Exception:
-            pass
-
-    if on_call_ended:
-        try:
-            on_call_ended(remote_call_ip)
-        except Exception:
-            pass
-
-    remote_call_ip = None
-
-def load_or_generate_rsa_keys():
-    if os.path.exists(RSA_PRIVATE_FILE):
-        with open(RSA_PRIVATE_FILE, "rb") as f:
-            return serialization.load_pem_private_key(f.read(), password=None)
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    with open(RSA_PRIVATE_FILE, "wb") as f:
-        f.write(private_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption()
-        ))
-    return private_key
-
-def get_rsa_public_bytes(private_key):
-    return private_key.public_key().public_bytes(
-        serialization.Encoding.PEM,
-        serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-
-def sign_data_rsa(private_key, data: bytes) -> bytes:
-    return private_key.sign(
-        data,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-        hashes.SHA256()
-    )
-
-def verify_rsa_signature(public_key_pem: bytes, signature: bytes, data: bytes):
-    pub = serialization.load_pem_public_key(public_key_pem)
-    pub.verify(signature, data,
-               padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-               hashes.SHA256()
-               )
-
-def generate_ecdh_key():
-    return ec.generate_private_key(ec.SECP256R1())
-
-def get_public_bytes(private_key):
-    return private_key.public_key().public_bytes(
-        serialization.Encoding.X962,
-        format=serialization.PublicFormat.UncompressedPoint
-    )
-
-def load_peer_public_key(pub_bytes):
-    return ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub_bytes)
-
-def derive_shared_key(my_private_key, their_public_key):
-    shared_secret = my_private_key.exchange(ec.ECDH(), their_public_key)
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=b"voip-demo"
-    ).derive(shared_secret)
 
 def save_contact(name: str, ip: str, rsa_pub_bytes: bytes):
     fingerprint = hashlib.sha256(rsa_pub_bytes).hexdigest()[:32]
@@ -256,6 +247,11 @@ def save_contact(name: str, ip: str, rsa_pub_bytes: bytes):
         if not replaced:
             f.write(f"{name}|{ip}|{rsa_str}|{fingerprint}\n")
     print(f"[INFO] Zapisano / zaktualizowano kontakt: {name} ({ip})")
+
+
+def is_call_active() -> bool:
+    with call_lock:
+        return call_active
 
 def load_contacts(raw: bool = False):
     if not os.path.exists(CONTACTS_FILE):
@@ -275,112 +271,7 @@ def load_contacts(raw: bool = False):
                 entries.append((name, ip, rsa_pem))
     return entries
 
-def network_audio_receiver(sock):
-    global aesgcm
-    sock.settimeout(1.0)
 
-    while True:
-        if stop_audio.is_set():
-            break
-        try:
-            data, _ = sock.recvfrom(1500)
-        except socket.timeout:
-            continue
-        except OSError as e:
-            break
-
-        if len(data) < 12:
-            continue
-        nonce, ciphertext = data[:12], data[12:]
-        try:
-            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-            AUDIO_QUEUE.put(plaintext)
-        except Exception as e:
-            continue
-
-def audio_play_callback(outdata, frames, time_info, status):
-    if status:
-        print("Audio (play) status:", status)
-    try:
-        data = AUDIO_QUEUE.get_nowait()
-    except queue.Empty:
-        outdata[:] = np.zeros((frames, CHANNELS))
-        return
-    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32767.0
-    outdata[:len(samples) // CHANNELS] = samples.reshape(-1, CHANNELS)
-
-def audio_send_callback(indata, frames, time_info, status):
-    global send_nonce_counter, nonce_prefix
-    if status:
-        print("Audio (send) status:", status)
-    samples = (indata.flatten() * 32767).astype(np.int16)
-    nonce = nonce_prefix + send_nonce_counter.to_bytes(8, 'big')
-    send_nonce_counter += 2  # 0,2,4… albo 1,3,5…
-    packet = nonce + aesgcm.encrypt(nonce, samples.tobytes(), None)
-    audio_sock.sendto(packet, (remote_ip_for_send, AUDIO_PORT))
-
-def start_audio_stream(remote_ip: str, initiator_role: bool):
-    global remote_call_ip, audio_sock, nonce_prefix, send_nonce_counter
-    global call_active, remote_ip_for_send, stop_audio
-
-    with call_lock:
-        if call_active:
-            print("[INFO] Już trwa połączenie – start_audio_stream zignorowany")
-            return
-        call_active = True
-
-    remote_call_ip = remote_ip
-    remote_ip_for_send = remote_ip
-    stop_audio.clear()
-
-    nonce_prefix = b"\x00\x00\x00\x00" if initiator_role else b"\x01\x00\x00\x00"
-    send_nonce_counter = 0
-
-    if on_call_started:
-        try:
-            on_call_started(remote_ip)
-        except Exception:
-            pass
-
-    rx_thread = threading.Thread(
-        target=network_audio_receiver, args=(audio_sock,), daemon=True
-    )
-    rx_thread.start()
-
-
-    try:
-        with sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            blocksize=BLOCK_FRAMES,
-            dtype="float32",
-            callback=audio_play_callback,
-        ), sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            blocksize=BLOCK_FRAMES,
-            dtype="float32",
-            callback=audio_send_callback,
-        ):
-
-            while not stop_audio.is_set():
-                time.sleep(0.1)
-
-    except Exception as e:
-        print("[ERROR] Audio stream:", e)
-
-    stop_audio.set()
-
-    if on_call_ended:
-        try:
-            on_call_ended(remote_ip)
-        except Exception:
-            pass
-
-    with call_lock:
-        call_active = False
-        remote_call_ip = None
-        remote_ip_for_send = None
 
 def stop_listener():
     listener_stop_event.set()
@@ -389,18 +280,6 @@ def stop_listener():
             listener_sock.close()
         except:
             pass
-
-def send_okfpr(ip):
-    rsa_private = load_or_generate_rsa_keys()
-    rsa_pub = get_rsa_public_bytes(rsa_private)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(b"OKFPR" + rsa_pub, (ip, CONTROL_PORT))
-
-def send_myrsa(ip):
-    rsa_private = load_or_generate_rsa_keys()
-    rsa_pub = get_rsa_public_bytes(rsa_private)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.sendto(b"MYRSA" + rsa_pub, (ip, CONTROL_PORT))
 
 def start_listener():
     listener_stop_event.clear()
@@ -459,27 +338,65 @@ def start_listener():
                     _safe(on_incoming_call_request, ip, None, _accept, _reject)
                     continue
 
-                elif data.startswith(b"FPR"):
-                    fingerprint = data[3:].decode()
-
-                    def _accept():
-                        send_okfpr(ip)                     # odsyłamy nasz RSA
-                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
                 elif data.startswith(b"OKFPR"):
+
                     rsa_data = data[len(b"OKFPR"):]
-                    def _save(name):
-                        save_contact(name, ip, rsa_data)
-                        send_myrsa(ip)  # wyślemy nasz RSA
-                        _safe(on_contact_saved, name, ip)
-                    _safe(on_request_contact_name, ip, rsa_data, _save)
+
+                    my_priv = load_or_generate_rsa_keys()
+
+                    my_pub = get_rsa_public_bytes(my_priv)
+                    pin = compute_sas_pin(my_pub, rsa_data)
+                    send_myrsa(ip)
+                    pending_name = PENDING_NAMES.get(ip)
+                    def _accept():
+                        if pending_name:
+                            save_contact(pending_name, ip, rsa_data)
+                            PENDING_NAMES.pop(ip, None)
+                            _safe(on_contact_saved, pending_name, ip)
+                        else:
+                            def _save(name):
+                                save_contact(name, ip, rsa_data)
+                                _safe(on_contact_saved, name, ip)
+                            _safe(on_request_contact_name, ip, rsa_data, _save)
+                    def _reject():
+                        pass
+                    _safe(on_sas_confirm, ip, pin, _accept, _reject)
+
+                elif data.startswith(b"FPR"):
+                    fingerprint = data[3:].decode()
+                    PENDING_FPR[ip] = fingerprint  # zapamiętaj, by przy MYRSA sprawdzić zgodność
+
+                    # pokaż okno „Nowy fingerprint” i po akceptacji odeślij OKFPR (twój RSA)
+                    def _accept():
+                        send_okfpr(ip)
+
+                    _safe(on_new_fpr, ip, fingerprint, _accept)
 
                 elif data.startswith(b"MYRSA"):
                     rsa_data = data[len(b"MYRSA"):]
-                    def _save(name):
-                        save_contact(name, ip, rsa_data)
-                        _safe(on_contact_saved, name, ip)
-                    _safe(on_request_contact_name, ip, rsa_data, _save)
+                    expected = PENDING_FPR.pop(ip, None)
+                    if expected:
+                        calc = hashlib.sha256(rsa_data).hexdigest()
+                        if calc != expected:
+                            _safe(on_security_alert, ip, "Odrzucono: klucz RSA nie pasuje do fingerprintu (FPR).")
+                            continue  # nie zapisuj, przerwij
+                    my_priv = load_or_generate_rsa_keys()
+                    my_pub = get_rsa_public_bytes(my_priv)
+                    pin = compute_sas_pin(my_pub, rsa_data)
+                    def _accept():
+                        pending_name = PENDING_NAMES.pop(ip, None)
+                        if pending_name:
+                            save_contact(pending_name, ip, rsa_data)
+                            _safe(on_contact_saved, pending_name, ip)
+                        else:
+                            def _save(name):
+                                save_contact(name, ip, rsa_data)
+                                _safe(on_contact_saved, name, ip)
+                            _safe(on_request_contact_name, ip, rsa_data, _save)
+                    def _reject():
+                        pass
+                    _safe(on_sas_confirm, ip, pin, _accept, _reject)
 
                 # odbiorca kończy rozmowę
                 elif data.startswith(b"END"):
@@ -489,20 +406,10 @@ def start_listener():
                 elif data.startswith(b"BUSY"):
                     _safe(on_busy, ip)
 
-                elif data.startswith(MSG_PREFIX):
-                    try:
-                        payload = data[len(MSG_PREFIX):].decode("utf-8", errors="ignore")
-                        ts, text = payload.split("|", 1)
-                    except ValueError:
-                        continue 
-
-                    _append_history(ip, "THEM", ts, text)
-                    _safe(on_text_message, ip, ts, text, True)  # True = incoming
-
-                elif data.startswith(CHAT_HELLO):
-                    their_pub = data[6:71]
-                    their_sig = data[71:327]
-                    their_rsa = data[327:]
+                elif data.startswith(b"HELLO"):
+                    their_pub = data[5:70]
+                    their_sig = data[70:326]
+                    their_rsa = data[326:]
 
                     stored_rsa = next((rsa for _, saved_ip, rsa in load_contacts() if saved_ip == ip), None)
                     if not stored_rsa or stored_rsa != their_rsa:
@@ -514,7 +421,7 @@ def start_listener():
 
                     _send_chat_ack(ip, their_pub)
 
-                elif data.startswith(CHAT_ACK):
+                elif data.startswith(b"CACK"):
                     their_pub = data[4:69]
                     their_sig = data[69:325]
 
@@ -531,7 +438,7 @@ def start_listener():
 
                     _finalize_chat_key(ip, my_priv, their_pub, caller=True)
 
-                elif data.startswith(TEXT_MSG_PREFIX):
+                elif data.startswith(b"MS2"):
                     nonce = data[3:15]
                     ciphertext = data[15:]
                     key = CHAT_KEYS.get(ip)
@@ -554,6 +461,33 @@ def start_listener():
 
     threading.Thread(target=listen, daemon=True).start()
 
+
+
+def _send_chat_ack(ip: str, their_pub_bytes: bytes):
+    """Wysyłamy CACK i kończymy handshake."""
+    priv = generate_ecdh_key()
+    pub  = get_public_bytes(priv)
+
+    rsa_priv = load_or_generate_rsa_keys()
+    signature = sign_data_rsa(rsa_priv, pub)
+
+    payload = b"CACK" + pub + signature
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(payload, (ip, CONTROL_PORT))
+
+    _finalize_chat_key(ip, priv, their_pub_bytes, caller=False)
+
+
+def _finalize_chat_key(ip: str, my_priv, their_pub_bytes: bytes, caller: bool):
+    chat_key = HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=None, info=b"vc-chat-v1"
+    ).derive(my_priv.exchange(ec.ECDH(), load_peer_public_key(their_pub_bytes)))
+
+    CHAT_KEYS[ip] = chat_key
+    CHAT_NONCE_PREFIX[ip] = CHAT_PREFIX_CALLER if caller else CHAT_PREFIX_CALLEE
+    CHAT_SEND_COUNTER[ip] = 0 if caller else 1
+    print(f"[CHAT] handshake OK z {ip}")
+
 def accept_incoming_call(ip: str, port, ecdh_pub: bytes):
 
     my_priv = generate_ecdh_key()
@@ -564,7 +498,9 @@ def accept_incoming_call(ip: str, port, ecdh_pub: bytes):
 
     shared_key = derive_shared_key(my_priv, load_peer_public_key(ecdh_pub))
     global aesgcm
+    from . import audio as _audio
     aesgcm = AESGCM(shared_key)
+    _audio.aesgcm = aesgcm
     chat_key = HKDF(
         algorithm=hashes.SHA256(), length=32, salt=None, info=b"vc-chat-v1"
     ).derive(shared_key)
@@ -579,6 +515,9 @@ def accept_incoming_call(ip: str, port, ecdh_pub: bytes):
         args=(ip, False),
         daemon=True
     ).start()
+
+
+
 
 def initiate_call(remote_ip):
     if is_call_active():
@@ -627,6 +566,7 @@ def initiate_call(remote_ip):
 
                 shared = derive_shared_key(my_priv, load_peer_public_key(their_pub))
                 aesgcm = AESGCM(shared)
+                _audio.aesgcm = aesgcm
                 chat_key = HKDF(
                     algorithm=hashes.SHA256(), length=32, salt=None, info=b"vc-chat-v1"
                 ).derive(shared)
